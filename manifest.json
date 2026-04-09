@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "IATS TECHNOLOGIES PVT LTD Business Extractor",
+  "description": "Extract business leads from Google Maps search results.",
+  "version": "1.0.0",
+  "action": {
+    "default_title": "Maps Extractor",
+    "default_popup": "popup.html"
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "downloads",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://www.google.com/maps/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.google.com/maps/*"
+      ],
+      "js": [
+        "utils.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

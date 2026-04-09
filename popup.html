@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Maps Extractor</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        min-width: 320px;
+        margin: 0;
+        padding: 14px;
+        background: #ffffff;
+        color: #1f2937;
+      }
+      h1 {
+        margin: 0 0 10px;
+        font-size: 16px;
+      }
+      .row {
+        margin-bottom: 10px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        margin-bottom: 4px;
+      }
+      input,
+      select,
+      button {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px;
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        font-size: 13px;
+      }
+      button {
+        cursor: pointer;
+      }
+      .actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .status {
+        font-size: 12px;
+        margin-top: 10px;
+        min-height: 16px;
+      }
+      .count {
+        margin-top: 8px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .download {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        margin-top: 10px;
+      }
+      .muted {
+        color: #6b7280;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Google Maps Extractor</h1>
+
+    <div class="row">
+      <label for="limitSelect">Limit extraction count</label>
+      <select id="limitSelect" aria-label="Limit extraction count">
+        <option value="5" selected>5</option>
+        <option value="100">100</option>
+        <option value="200">200</option>
+        <option value="500">500</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label for="categoryFilter">Search keyword (required for auto-search)</label>
+      <input id="categoryFilter" type="text" placeholder="e.g. clothing shops" />
+    </div>
+
+    <div class="row">
+      <label for="locationInput">Location (optional)</label>
+      <input id="locationInput" type="text" placeholder="e.g. chennai, madurai, salem" />
+    </div>
+
+    <div class="actions">
+      <button id="startBtn">Start Extraction</button>
+      <button id="stopBtn">Stop</button>
+    </div>
+    <div class="row" style="margin-top: 8px;">
+      <button id="resetBtn">Reset Inputs</button>
+    </div>
+
+    <div id="countText" class="count">Extracted: 0</div>
+    <div id="statusText" class="status muted">Open a Google Maps results page first.</div>
+
+    <div class="download">
+      <button id="downloadCsvBtn">Download CSV</button>
+      <button id="downloadJsonBtn">Download JSON</button>
+    </div>
+    <div class="row" style="margin-top: 8px;">
+      <button id="downloadTxtBtn">Download TXT</button>
+    </div>
+
+    <script src="utils.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
