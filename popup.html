@@ -69,12 +69,14 @@
 
     <div class="row">
       <label for="limitSelect">Limit extraction count</label>
-      <select id="limitSelect" aria-label="Limit extraction count">
-        <option value="5" selected>5</option>
-        <option value="100">100</option>
-        <option value="200">200</option>
-        <option value="500">500</option>
-      </select>
+      <input
+        id="limitSelect"
+        type="number"
+        min="1"
+        max="1000"
+        value="5"
+        aria-label="Limit extraction count"
+      />
     </div>
 
     <div class="row">

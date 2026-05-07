@@ -40,38 +40,65 @@
     },
 
     cleanAddress(rawAddress) {
-      let address = utils
-        .trimText(rawAddress)
-        .replace(/[^\x20-\x7E]/g, " ")
-        .replace(/\s+/g, " ");
+      let address = utils.trimText(rawAddress);
 
       if (!address) {
         return "";
       }
 
-      if (address.includes("·")) {
+      // Split on "·" (U+00B7) BEFORE stripping non-ASCII, otherwise the dot is
+      // gone and we end up keeping "Jewelry store 29, N Usman Rd".
+      // Also handle the middle-dot variant "•" and the bullet "‧".
+      const SEP = /[\u00B7\u2022\u2027]/;
+      if (SEP.test(address)) {
         const parts = address
-          .split("·")
+          .split(SEP)
           .map((p) => utils.trimText(p))
           .filter(Boolean);
+        // Prefer the part that contains a digit or comma (likely the address).
         const likelyAddress = [...parts].reverse().find((p) => /\d|,/.test(p));
         if (likelyAddress) {
           address = likelyAddress;
         }
       }
 
+      // Now strip remaining non-ASCII (icons, etc.) and collapse spaces.
+      address = address
+        .replace(/[^\x20-\x7E]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      // Drop a leading category-like word that wasn't separated by "·"
+      // e.g. "Jewelry store 29, N Usman Rd" -> "29, N Usman Rd".
+      const leadingMatch = address.match(/^([A-Za-z][A-Za-z &/-]+?)\s+(\d.*)$/);
+      if (leadingMatch && /\b(store|shop|market|bakery|cafe|restaurant|hotel|supermarket|mall|pharmacy|salon|gym|studio|jeweller(?:s|y)|jewellers|boutique|showroom|outlet|center|centre|services?)\b/i.test(leadingMatch[1])) {
+        address = leadingMatch[2];
+      }
+
       return address;
+    },
+
+    cleanWebsite(rawWebsite) {
+      const value = utils.trimText(rawWebsite).replace(/[^\x20-\x7E]/g, "");
+      if (!value) {
+        return "No website";
+      }
+      return value;
+    },
+
+    cleanOpeningHours(rawHours) {
+      const value = utils.trimText(rawHours).replace(/[^\x20-\x7E]/g, " ").replace(/\s+/g, " ").trim();
+      return value || "Hours not listed";
     },
 
     normalizeEntry(entry) {
       const normalized = {
         name: utils.cleanName(entry.name),
-        rating: utils.trimText(entry.rating),
         address: utils.cleanAddress(entry.address),
         phone: utils.cleanPhone(entry.phone),
-        category: utils.trimText(entry.category).replace(/[^\x20-\x7E]/g, ""),
-        description: utils.trimText(entry.description).replace(/[^\x20-\x7E]/g, ""),
-        reviewsCount: utils.trimText(entry.reviewsCount)
+        website: utils.cleanWebsite(entry.website),
+        openingHours: utils.cleanOpeningHours(entry.openingHours),
+        category: utils.trimText(entry.category).replace(/[^\x20-\x7E]/g, "")
       };
 
       if (!normalized.phone || !normalized.name) {
@@ -116,7 +143,6 @@
       const haystack = [
         entry.category,
         entry.name,
-        entry.description,
         entry.address
       ]
         .map((v) => utils.trimText(v).toLowerCase())
@@ -139,7 +165,7 @@
     },
 
     toCSV(entries) {
-      const headers = ["name", "rating", "address", "phone", "category", "description", "reviewsCount"];
+      const headers = ["name", "address", "phone", "website", "openingHours", "category"];
       const escapeCell = (value) => {
         const text = utils.trimText(value);
         const escaped = text.replace(/"/g, "\"\"");
@@ -155,7 +181,22 @@
     },
 
     toPrettyLine(entry) {
-      return `name: ${entry.name}, phone: ${entry.phone}, category: ${entry.category}, description: ${entry.description}`;
+      const safe = (value, fallback = "") => {
+        if (value === null || value === undefined) {
+          return fallback;
+        }
+        const text = String(value).trim();
+        return text || fallback;
+      };
+
+      return [
+        `name: ${safe(entry.name, "Unknown")}`,
+        `address: ${safe(entry.address, "Address not listed")}`,
+        `phone: ${safe(entry.phone, "No phone")}`,
+        `website: ${safe(entry.website, "No website")}`,
+        `openingHours: ${safe(entry.openingHours, "Hours not listed")}`,
+        `category: ${safe(entry.category, "")}`
+      ].join(", ");
     }
   };
 

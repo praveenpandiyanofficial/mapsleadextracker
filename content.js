@@ -1,5 +1,15 @@
 /* global MapsExtractorUtils */
 
+// Guard against double-injection: the manifest's content_scripts auto-loads
+// this file on Maps pages, and popup.js may also re-inject it via
+// chrome.scripting.executeScript when the message port is closed.
+// Without this guard, `const extractorState` below throws
+// "Identifier 'extractorState' has already been declared".
+if (window.__mapsExtractorContentLoaded__) {
+  // Already loaded once on this page; do nothing.
+} else {
+  window.__mapsExtractorContentLoaded__ = true;
+
 const extractorState = {
   running: false,
   stopRequested: false
@@ -32,23 +42,17 @@ function upsertOverlay(statusText) {
 }
 
 function sendProgress(payload) {
-  const status = payload?.stage === "running"
-    ? `Maps Extractor: ${payload.extracted || 0} extracted (${payload.processed || 0}/${payload.cardsTotal || 0})`
-    : payload?.stage === "start"
-      ? "Maps Extractor: started..."
-      : payload?.stage === "done"
-        ? "Maps Extractor: done"
-        : "Maps Extractor";
-  upsertOverlay(status);
+  upsertOverlay(
+    payload?.stage === "running"
+      ? `Maps Extractor (runs in background): ${payload.extracted || 0} extracted (${payload.processed || 0}/${payload.cardsTotal || 0}) — keep this Maps tab open`
+      : payload?.stage === "start"
+        ? "Maps Extractor: started… Keep this Google Maps tab open. You may switch to other tabs/windows."
+        : payload?.stage === "done"
+          ? "Maps Extractor: finished"
+          : "Maps Extractor"
+  );
 
-  try {
-    chrome.runtime.sendMessage({
-      action: "extractionProgress",
-      ...payload
-    });
-  } catch (error) {
-    // Popup may be closed; ignore progress errors.
-  }
+  chrome.runtime.sendMessage({ action: "extractionProgress", ...payload }).catch(() => {});
 }
 
 function randomBetween(min, max) {
@@ -140,12 +144,11 @@ async function extractFromPlaceUrl(placeUrl) {
     const html = await response.text();
     const entry = {
       name: "",
-      rating: "",
       address: "",
       phone: "",
-      category: "",
-      description: "",
-      reviewsCount: ""
+      website: "",
+      openingHours: "",
+      category: ""
     };
 
     const scriptMatches = [...html.matchAll(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
@@ -164,11 +167,22 @@ async function extractFromPlaceUrl(placeUrl) {
 
         entry.name = MapsExtractorUtils.trimText(business.name || entry.name);
         entry.phone = MapsExtractorUtils.trimText(business.telephone || business.phone || entry.phone);
-        entry.description = MapsExtractorUtils.trimText(business.description || entry.description);
+        entry.website = MapsExtractorUtils.trimText(business.url || business.website || entry.website);
 
-        if (business.aggregateRating && typeof business.aggregateRating === "object") {
-          entry.rating = MapsExtractorUtils.trimText(business.aggregateRating.ratingValue || entry.rating);
-          entry.reviewsCount = MapsExtractorUtils.trimText(business.aggregateRating.reviewCount || entry.reviewsCount);
+        if (business.openingHours) {
+          if (Array.isArray(business.openingHours)) {
+            entry.openingHours = business.openingHours.join("; ");
+          } else {
+            entry.openingHours = MapsExtractorUtils.trimText(business.openingHours);
+          }
+        } else if (Array.isArray(business.openingHoursSpecification)) {
+          entry.openingHours = business.openingHoursSpecification
+            .map((spec) => {
+              const days = Array.isArray(spec.dayOfWeek) ? spec.dayOfWeek.join(",") : spec.dayOfWeek || "";
+              return [days, spec.opens, spec.closes].filter(Boolean).join(" ");
+            })
+            .filter(Boolean)
+            .join("; ");
         }
 
         if (business.address) {
@@ -213,27 +227,50 @@ async function extractFromPlaceUrl(placeUrl) {
 }
 
 function getResultsFeed() {
-  const directFeed = (
-    document.querySelector('div[role="feed"]') ||
-    document.querySelector('div[aria-label][role="main"] div[role="region"] div[role="feed"]') ||
-    document.querySelector('div[role="main"] div[role="region"][aria-label]')
-  );
-
-  if (directFeed) {
-    return directFeed;
+  // 1. Authoritative selector: actual search-results feed.
+  const direct = document.querySelector('div[role="feed"]');
+  if (direct) {
+    return direct;
   }
 
-  const placeLink = document.querySelector('a[href*="/maps/place/"]');
-  if (!placeLink) {
+  // 2. Some Maps layouts use a region whose aria-label starts with "Results for".
+  // Be VERY careful here: a region with aria-label="Information for <name>" is
+  // the SINGLE-PLACE info panel — that must NOT be treated as a results feed
+  // (otherwise we'd mine related-business links and end up with no-name cards).
+  const regions = document.querySelectorAll('div[role="main"] div[role="region"][aria-label]');
+  for (const region of regions) {
+    const aria = (region.getAttribute("aria-label") || "").toLowerCase();
+    if (/^(results|search results)/i.test(aria)) {
+      return region;
+    }
+  }
+
+  // 3. Heuristic fallback: a scrollable ancestor of multiple distinct
+  // /maps/place/ links. We DO NOT run this when we're on a /maps/place/<one>/
+  // URL because such pages frequently include "related businesses" / "people
+  // also search for" panels that contain several place links — those would be
+  // wrongly identified as a results feed and lead to no-name cards.
+  if (/\/maps\/place\//.test(window.location.href)) {
     return null;
   }
 
+  const placeLinks = [...document.querySelectorAll('a[href*="/maps/place/"]')];
+  const distinctHrefs = new Set(placeLinks.map((a) => a.getAttribute("href")));
+  if (distinctHrefs.size < 2) {
+    return null;
+  }
+
+  const placeLink = placeLinks[0];
   let current = placeLink.parentElement;
   while (current && current !== document.body) {
     const style = window.getComputedStyle(current);
     const isScrollable = /(auto|scroll)/.test(style.overflowY);
     if (isScrollable && current.scrollHeight > current.clientHeight + 100) {
-      return current;
+      const localLinks = [...current.querySelectorAll('a[href*="/maps/place/"]')];
+      const localDistinct = new Set(localLinks.map((a) => a.getAttribute("href")));
+      if (localDistinct.size >= 2) {
+        return current;
+      }
     }
     current = current.parentElement;
   }
@@ -241,28 +278,72 @@ function getResultsFeed() {
   return null;
 }
 
+function isOnSinglePlacePage() {
+  // /maps/place/<name>/... means we're focused on ONE business, not a results list.
+  const url = window.location.href;
+  if (!/\/maps\/place\//.test(url)) {
+    return false;
+  }
+  // No real results feed AND there's an Information panel for this single place.
+  const hasInfoPanel = !!document.querySelector('div[role="region"][aria-label^="Information"]');
+  const hasRealFeed = !!getResultsFeed();
+  return hasInfoPanel && !hasRealFeed;
+}
+
 function getBusinessCards() {
   const feed = getResultsFeed();
-  const root = feed || document;
 
-  const cards = [...root.querySelectorAll('div[role="article"]')];
-  if (cards.length > 0) {
-    return cards;
+  // Only consider cards that belong to an actual results list. If there's no feed,
+  // do NOT scan the whole document — that picks up the Google Account avatar in
+  // the header (which has aria-label="Google Account: ...") and other unrelated
+  // place links elsewhere in the page chrome.
+  if (!feed) {
+    return [];
   }
 
-  return [...root.querySelectorAll('a[href*="/maps/place/"]')];
+  const articleCards = [...feed.querySelectorAll('div[role="article"]')];
+  if (articleCards.length > 0) {
+    return articleCards;
+  }
+
+  // Fallback within the feed only: /maps/place/ anchors inside the feed itself.
+  const feedLinks = [...feed.querySelectorAll('a[href*="/maps/place/"]')];
+  const seen = new Set();
+  const unique = [];
+  for (const link of feedLinks) {
+    const href = link.getAttribute("href") || "";
+    if (href && !seen.has(href)) {
+      seen.add(href);
+      unique.push(link);
+    }
+  }
+  return unique;
 }
 
 async function autoScrollResults(maxWanted) {
+  // Wait for either a results feed OR at least one business card to appear.
   const startedAt = Date.now();
   let feed = getResultsFeed();
-  while (!feed && Date.now() - startedAt < 12000) {
-    await delay(300);
+  while (!feed && Date.now() - startedAt < 15000) {
+    await delay(400);
     feed = getResultsFeed();
+    if (!feed && getBusinessCards().length > 0) {
+      // Cards exist but we couldn't classify a feed; bail out and let the loop work without scrolling.
+      break;
+    }
   }
 
   if (!feed) {
-    throw new Error("Could not find results panel. Open a Google Maps search results page first.");
+    if (isOnSinglePlacePage()) {
+      // Single-place page: caller will extract just that one business.
+      return;
+    }
+    if (getBusinessCards().length === 0) {
+      throw new Error(
+        "No business cards found. Open the Google Maps search results list (left side panel) on this tab and run again."
+      );
+    }
+    return;
   }
 
   let previousCount = 0;
@@ -295,8 +376,67 @@ async function autoScrollResults(maxWanted) {
   }
 }
 
-function extractFromDetailsPanel() {
-  const panel = document.querySelector('div[role="main"]') || document;
+function getActiveInfoPanel(expectedName) {
+  const regions = [...document.querySelectorAll('div[role="region"][aria-label^="Information"]')];
+
+  // 1. Prefer the region whose aria-label actually matches the expected business.
+  if (expectedName && regions.length > 0) {
+    const expectedNorm = MapsExtractorUtils
+      .cleanName(expectedName)
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    for (const region of regions) {
+      const aria = (region.getAttribute("aria-label") || "")
+        .replace(/^Information for\s*/i, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9 ]/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (aria && expectedNorm && (aria === expectedNorm || aria.includes(expectedNorm) || expectedNorm.includes(aria))) {
+        return region;
+      }
+    }
+  }
+
+  // 2. Otherwise prefer the visible region.
+  for (const region of regions) {
+    const rect = region.getBoundingClientRect?.();
+    if (rect && rect.height > 0 && rect.width > 0) {
+      return region;
+    }
+  }
+
+  // 3. Last visible region in DOM order.
+  if (regions.length > 0) {
+    return regions[regions.length - 1];
+  }
+
+  // 4. Newer Maps layouts may not expose "Information for ..." regions.
+  // Find the closest container around the visible place title.
+  const visibleTitle =
+    document.querySelector('h1.DUwDvf') ||
+    document.querySelector('h1.fontHeadlineLarge') ||
+    document.querySelector('h1[class*="fontHeadline"]') ||
+    document.querySelector('div[role="heading"][aria-level="1"]');
+  if (visibleTitle) {
+    const placePanel =
+      visibleTitle.closest('div[role="main"]') ||
+      visibleTitle.closest('div[role="region"]') ||
+      visibleTitle.closest("section") ||
+      visibleTitle.parentElement;
+    if (placePanel) {
+      return placePanel;
+    }
+  }
+
+  return document.querySelector('div[role="main"]') || document;
+}
+
+function extractFromDetailsPanel(expectedName) {
+  const panel = getActiveInfoPanel(expectedName);
 
   const getText = (selector) => {
     const el = panel.querySelector(selector);
@@ -319,42 +459,217 @@ function extractFromDetailsPanel() {
   };
 
   const extractPhone = () => {
-    const copyValueNode = panel.querySelector(
+    const phoneRegex = /(\+?\d[\d\s\-()]{7,}\d)/;
+
+    // Strategy 1: Google sets data-item-id="phone:tel:+91XXX..." on the phone row.
+    const phoneItems = panel.querySelectorAll(
       [
-        'button[aria-label*="Copy phone number"] .Io6YTe.fontBodyMedium.kR99db.fdkmkc',
-        'button[data-item-id*="phone"] .Io6YTe.fontBodyMedium.kR99db.fdkmkc',
-        'div[data-item-id*="phone"] .Io6YTe.fontBodyMedium.kR99db.fdkmkc'
+        '[data-item-id^="phone:tel:"]',
+        '[data-item-id*="phone:tel:"]',
+        '[data-item-id*="phone"]'
       ].join(",")
     );
-    if (copyValueNode) {
-      const val = MapsExtractorUtils.trimText(copyValueNode.textContent || "");
-      if (val) {
-        return val;
+    for (const el of phoneItems) {
+      const itemId = el.getAttribute("data-item-id") || "";
+      const idMatch = itemId.match(/tel:([+\d][\d\s\-()]{6,}\d)/i);
+      if (idMatch) {
+        return idMatch[1];
       }
     }
 
-    const candidates = panel.querySelectorAll(
+    // Strategy 2: tel: anchor.
+    const telLink = panel.querySelector('a[href^="tel:"]');
+    if (telLink) {
+      const href = telLink.getAttribute("href") || "";
+      const cleaned = href.replace(/^tel:/i, "").trim();
+      if (cleaned) {
+        return cleaned;
+      }
+    }
+
+    // Strategy 3: aria-label like "Phone: 044 4385 1799" or "Call 044...".
+    const ariaCandidates = panel.querySelectorAll('[aria-label]');
+    for (const el of ariaCandidates) {
+      const aria = el.getAttribute("aria-label") || "";
+      const labelMatch = aria.match(/\b(?:Phone|Call|Tel)[^\d+]*([+\d][\d\s\-()]{7,}\d)/i);
+      if (labelMatch) {
+        return labelMatch[1];
+      }
+    }
+
+    // Strategy 4: visible text inside any phone-tagged button/row.
+    const phoneRows = panel.querySelectorAll(
       [
+        'button[aria-label*="Copy phone number"]',
         'button[data-item-id*="phone"]',
         'a[data-item-id*="phone"]',
-        'button[aria-label*="Phone"]',
-        'button[aria-label*="Call"]',
-        'a[href^="tel:"]'
+        'div[data-item-id*="phone"]'
       ].join(",")
     );
-
-    for (const el of candidates) {
-      const source = [
-        el.getAttribute("data-item-id"),
-        el.getAttribute("aria-label"),
-        el.getAttribute("href"),
-        el.textContent
-      ]
-        .filter(Boolean)
-        .join(" ");
-      const match = source.match(/(\+?\d[\d\s\-()]{7,}\d)/);
+    for (const row of phoneRows) {
+      const text = MapsExtractorUtils.trimText(row.textContent || "");
+      const match = text.match(phoneRegex);
       if (match) {
         return match[1];
+      }
+    }
+
+    // Strategy 5: phone-icon row sibling (works when classes change).
+    const phoneIcon = panel.querySelector(
+      'img[src*="phone"], img[alt*="Phone"], [aria-label*="phone" i] svg'
+    );
+    if (phoneIcon) {
+      const row = phoneIcon.closest('button, div, a');
+      if (row) {
+        const match = MapsExtractorUtils.trimText(row.textContent || "").match(phoneRegex);
+        if (match) {
+          return match[1];
+        }
+      }
+    }
+
+    // Strategy 6: scan all field-value cells (Google uses class Io6YTe for them).
+    // We look for the cell whose text is essentially a phone number.
+    const valueCells = panel.querySelectorAll(".Io6YTe, [class*='Io6YTe']");
+    for (const cell of valueCells) {
+      const text = MapsExtractorUtils.trimText(cell.textContent || "");
+      if (!text) continue;
+      const compact = text.replace(/[^\d+]/g, "");
+      const looksLikePhone =
+        /^[+\d][\d\s\-()]{7,}\d$/.test(text) && compact.length >= 8 && compact.length <= 15;
+      if (looksLikePhone) {
+        return text;
+      }
+    }
+
+    // Strategy 7: line-by-line scan of the visible panel text.
+    // Safe here because clickCardAndExtract verifies the panel actually changed.
+    const panelLines = (panel.innerText || "")
+      .split("\n")
+      .map((line) => MapsExtractorUtils.trimText(line))
+      .filter(Boolean);
+    for (const line of panelLines) {
+      const compact = line.replace(/[^\d+]/g, "");
+      const looksLikePhone =
+        /^[+\d][\d\s\-()]{7,}\d$/.test(line) && compact.length >= 8 && compact.length <= 15;
+      if (looksLikePhone) {
+        return line;
+      }
+    }
+
+    return "";
+  };
+
+  const extractWebsite = () => {
+    const isExternal = (href) =>
+      href &&
+      /^https?:\/\//i.test(href) &&
+      !href.includes("google.com") &&
+      !href.includes("googleusercontent.com") &&
+      !href.includes("/maps/");
+
+    // Strategy 1: the standard "Open website" / authority anchor.
+    const authorityLink = panel.querySelector(
+      [
+        'a[data-item-id="authority"]',
+        'a[data-item-id*="authority"]',
+        'a[aria-label^="Website:"]',
+        'a[aria-label*="Website"]',
+        'a[data-tooltip*="Open website"]',
+        'a[data-tooltip*="website"]'
+      ].join(",")
+    );
+    if (authorityLink) {
+      const href = authorityLink.getAttribute("href") || "";
+      if (isExternal(href)) {
+        return href;
+      }
+      // aria-label: "Website: gymitfitness.com"
+      const aria = authorityLink.getAttribute("aria-label") || "";
+      const ariaMatch = aria.match(/^Website:\s*(.+?)\s*$/i);
+      if (ariaMatch && ariaMatch[1].trim()) {
+        return ariaMatch[1].trim();
+      }
+      // Inner value cell.
+      const valueCell = authorityLink.querySelector(".Io6YTe, [class*='Io6YTe']");
+      if (valueCell) {
+        const text = MapsExtractorUtils.trimText(valueCell.textContent || "");
+        if (text) {
+          return text;
+        }
+      }
+      const text = MapsExtractorUtils.trimText(authorityLink.textContent || "");
+      if (text && /\./.test(text)) {
+        return text;
+      }
+    }
+
+    // Strategy 2: any element with an aria-label of "Website: ...".
+    const websiteAria = panel.querySelector('[aria-label^="Website:"]');
+    if (websiteAria) {
+      const aria = websiteAria.getAttribute("aria-label") || "";
+      const ariaMatch = aria.match(/^Website:\s*(.+?)\s*$/i);
+      if (ariaMatch && ariaMatch[1].trim()) {
+        return ariaMatch[1].trim();
+      }
+    }
+
+    // Strategy 3: any anchor pointing to an external URL.
+    const externalLinks = panel.querySelectorAll('a[href^="http"]');
+    for (const link of externalLinks) {
+      const href = link.getAttribute("href") || "";
+      if (isExternal(href)) {
+        return href;
+      }
+    }
+
+    // Strategy 4: a field-value cell whose text looks like a domain.
+    const valueCells = panel.querySelectorAll(".Io6YTe, [class*='Io6YTe']");
+    for (const cell of valueCells) {
+      const text = MapsExtractorUtils.trimText(cell.textContent || "");
+      if (!text) continue;
+      const domainOnly = /^[a-z0-9][a-z0-9.\-]*\.[a-z]{2,}$/i.test(text);
+      const hasDomain = /\b[a-z0-9.\-]+\.(com|in|net|org|co|io|biz|info|app|store|shop|me|us|uk)\b/i.test(text);
+      if (domainOnly || hasDomain) {
+        return text;
+      }
+    }
+
+    return "";
+  };
+
+  const extractOpeningHours = () => {
+    // Strategy 1: the small status line "Open · Closes 10:30 pm".
+    const statusNode = panel.querySelector(".ZDu9vd, .o0Svhf .ZDu9vd");
+    if (statusNode) {
+      const text = MapsExtractorUtils.trimText(statusNode.textContent || "");
+      if (text) {
+        return text;
+      }
+    }
+
+    // Strategy 2: the wrapper button with aria-expanded for the hours dropdown.
+    const hoursToggle = panel.querySelector(
+      [
+        '[jsaction*="openhours"]',
+        '[aria-label^="Hours:"]',
+        '[data-item-id*="oh"]',
+        '[aria-label="Hours"] ~ * .ZDu9vd'
+      ].join(",")
+    );
+    if (hoursToggle) {
+      const text = MapsExtractorUtils.trimText(hoursToggle.textContent || "");
+      if (text) {
+        return text.replace(/Show open hours.*$/i, "").trim();
+      }
+    }
+
+    // Strategy 3: aria-label fallback.
+    const ariaNode = panel.querySelector('[aria-label*="Hours" i]');
+    if (ariaNode) {
+      const aria = MapsExtractorUtils.trimText(ariaNode.getAttribute("aria-label") || "");
+      if (aria) {
+        return aria;
       }
     }
 
@@ -413,6 +728,17 @@ function extractFromDetailsPanel() {
 
   const name =
     getText("h1") ||
+    getText('h1.DUwDvf') ||
+    getText('h1.fontHeadlineLarge') ||
+    getText('div[role="heading"][aria-level="1"]') ||
+    MapsExtractorUtils.trimText(
+      (
+        document.querySelector("h1.DUwDvf") ||
+        document.querySelector("h1.fontHeadlineLarge") ||
+        document.querySelector('div[role="heading"][aria-level="1"]') ||
+        {}
+      ).textContent || ""
+    ) ||
     getText('h1[aria-level="1"]') ||
     getText('div[role="main"] h1');
 
@@ -440,69 +766,136 @@ function extractFromDetailsPanel() {
     }
   }
 
-  const address = getByDataItem("address");
-  const phone = getByDataItem("phone") || extractPhone();
+  const extractAddress = () => {
+    // Strategy 1: aria-label="Address: ..." (most reliable, gives full address text)
+    const addrButton = panel.querySelector(
+      [
+        '[data-item-id="address"]',
+        '[data-item-id*="address"]',
+        '[aria-label^="Address:"]',
+        'button[aria-label^="Address"]'
+      ].join(",")
+    );
+    if (addrButton) {
+      const aria = addrButton.getAttribute("aria-label") || "";
+      const ariaMatch = aria.match(/^Address:\s*([\s\S]+?)\s*$/i);
+      if (ariaMatch && ariaMatch[1].trim()) {
+        return ariaMatch[1].trim();
+      }
+
+      // Strategy 2: the value cell inside the address row.
+      const valueCell = addrButton.querySelector(".Io6YTe, [class*='Io6YTe']");
+      if (valueCell) {
+        const text = MapsExtractorUtils.trimText(valueCell.textContent || "");
+        if (text) {
+          return text;
+        }
+      }
+
+      // Strategy 3: textContent of the row as last resort.
+      const rowText = MapsExtractorUtils.trimText(addrButton.textContent || "");
+      if (rowText) {
+        return rowText;
+      }
+    }
+    return "";
+  };
+
+  const address = extractAddress();
+  const phone =
+    getByDataItem("phone") ||
+    getByDataItem("tel") ||
+    extractPhone();
+  const website = extractWebsite();
+  const openingHours = extractOpeningHours();
 
   const category =
     getText('button[jsaction*="pane.rating.category"]') ||
     getText('div[role="main"] button[aria-label*="category"]') ||
     getText('div[role="main"] span button');
 
-  const description =
-    getByDataItem("description") ||
-    getText('div[aria-label*="From"] span') ||
-    getText('div[role="main"] div[jsaction] span');
-
   const parsed = parseFromPanelText();
 
   return {
     name: name || parsed.name,
-    rating,
     address: address || parsed.address,
     phone: phone || parsed.phone,
-    category: category || parsed.category,
-    description,
-    reviewsCount
+    website,
+    openingHours,
+    category: category || parsed.category
   };
+}
+
+function readNameFromCard(card) {
+  // 1. card aria-label (works for div[role="article"] cards).
+  const aria = MapsExtractorUtils.trimText(card.getAttribute?.("aria-label") || "");
+  if (aria) {
+    const firstPart = aria.split("·")[0]?.split(",")[0] || "";
+    const cleaned = MapsExtractorUtils.cleanName(firstPart);
+    if (cleaned) {
+      return cleaned;
+    }
+  }
+
+  // 2. inner heading (works for some Maps layouts that wrap names in h3 / role=heading).
+  const heading = card.querySelector?.('h3, [role="heading"], .qBF1Pd, .fontHeadlineSmall');
+  if (heading) {
+    const cleaned = MapsExtractorUtils.cleanName(heading.textContent || "");
+    if (cleaned) {
+      return cleaned;
+    }
+  }
+
+  // 3. inner /maps/place/ link's aria-label or text.
+  const link = card.matches?.('a[href*="/maps/place/"]')
+    ? card
+    : card.querySelector?.('a[href*="/maps/place/"]');
+  if (link) {
+    const linkAria = MapsExtractorUtils.cleanName(link.getAttribute("aria-label") || "");
+    if (linkAria) {
+      return linkAria;
+    }
+    const linkText = MapsExtractorUtils.cleanName(link.textContent || "");
+    if (linkText) {
+      return linkText;
+    }
+    // 4. derive name from the place URL slug as last resort.
+    const href = link.getAttribute("href") || "";
+    const slugMatch = href.match(/\/maps\/place\/([^/]+)\//);
+    if (slugMatch) {
+      const fromSlug = decodeURIComponent(slugMatch[1])
+        .replace(/\+/g, " ")
+        .replace(/_/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      const cleaned = MapsExtractorUtils.cleanName(fromSlug);
+      if (cleaned) {
+        return cleaned;
+      }
+    }
+  }
+
+  return "";
 }
 
 function extractFallbackFromCard(card) {
   const text = MapsExtractorUtils.trimText(
-    `${card.getAttribute("aria-label") || ""} ${card.textContent || ""}`
+    `${card.getAttribute?.("aria-label") || ""} ${card.textContent || ""}`
   );
-  const aria = MapsExtractorUtils.trimText(card.getAttribute("aria-label") || "");
-  const firstPart = aria.split("·")[0]?.split(",")[0] || "";
   const phoneMatch = text.match(/(\+?\d[\d\s\-()]{7,}\d)/);
   const addressMatch = text.match(/(\d[^|]*?,[^|]{5,})/);
   return {
-    name: MapsExtractorUtils.cleanName(firstPart) || MapsExtractorUtils.cleanName(aria),
-    rating: "",
+    name: readNameFromCard(card),
     address: MapsExtractorUtils.cleanAddress(addressMatch ? addressMatch[1] : ""),
     phone: phoneMatch ? phoneMatch[1] : "",
-    category: "",
-    description: "",
-    reviewsCount: ""
+    website: "",
+    openingHours: "",
+    category: ""
   };
 }
 
 function getExpectedNameFromCard(card) {
-  const aria = MapsExtractorUtils.trimText(card.getAttribute("aria-label") || "");
-  const byAria = aria.split("·")[0]?.split(",")[0] || "";
-  if (MapsExtractorUtils.cleanName(byAria)) {
-    return MapsExtractorUtils.cleanName(byAria);
-  }
-
-  const heading = card.querySelector('h3, [role="heading"]');
-  if (heading) {
-    return MapsExtractorUtils.cleanName(heading.textContent || "");
-  }
-
-  const link = card.querySelector('a[href*="/maps/place/"]');
-  if (link) {
-    return MapsExtractorUtils.cleanName(link.getAttribute("aria-label") || link.textContent || "");
-  }
-
-  return "";
+  return readNameFromCard(card);
 }
 
 function normalizeNameForCompare(name) {
@@ -532,10 +925,32 @@ async function clickCardAndExtract(card) {
   const expectedName = getExpectedNameFromCard(card);
 
   const getPanelSignature = () => {
+    const panel = getActiveInfoPanel(expectedName);
     const title = MapsExtractorUtils.trimText((document.querySelector("h1") || {}).textContent || "");
-    const addrNode = document.querySelector('[data-item-id*="address"]');
+    const addrNode = panel.querySelector('[data-item-id*="address"]');
     const address = MapsExtractorUtils.trimText((addrNode || {}).textContent || "");
-    return `${window.location.href}|${title}|${address}`;
+    const ariaLabel = panel.getAttribute?.("aria-label") || "";
+    return `${window.location.href}|${title}|${address}|${ariaLabel}`;
+  };
+
+  // Wait until the panel for THIS business is the visible/active one and contains
+  // its address row (which means phone/website rows are also painted).
+  const waitForPanelReady = async (timeoutMs) => {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      const panel = getActiveInfoPanel(expectedName);
+      const ariaLabel = (panel.getAttribute?.("aria-label") || "").replace(/^Information for\s*/i, "");
+      const ariaMatches =
+        !expectedName ||
+        namesLookSame(ariaLabel, expectedName);
+      const addrNode = panel.querySelector('[data-item-id*="address"]');
+      const addrText = MapsExtractorUtils.trimText((addrNode || {}).textContent || "");
+      if (ariaMatches && addrText.length > 5) {
+        return true;
+      }
+      await delay(200);
+    }
+    return false;
   };
 
   let details = null;
@@ -555,13 +970,23 @@ async function clickCardAndExtract(card) {
       }
       await delay(250);
     }
+
+    // Even if signature changed, wait until the panel's address cell is populated
+    // so phone/website/hours are also rendered before we extract.
+    if (panelChanged) {
+      await waitForPanelReady(4000);
+    }
     await delay(randomBetween(700, 1400));
 
     if (panelChanged) {
-      details = extractFromDetailsPanel();
+      details = extractFromDetailsPanel(expectedName);
     }
 
-    if (panelChanged && details?.name) {
+    if (panelChanged && details?.name && MapsExtractorUtils.cleanPhone(details?.phone || "")) {
+      break;
+    }
+    if (panelChanged && details?.name && attempt === 1) {
+      // Accept name-only on second attempt; phone may genuinely be absent.
       break;
     }
   }
@@ -571,14 +996,13 @@ async function clickCardAndExtract(card) {
     const fromUrl = await extractFromPlaceUrl(placeUrl);
     const candidate = {
       name: MapsExtractorUtils.cleanName(fromUrl?.name) || fallback.name,
-      rating: fromUrl?.rating || fallback.rating,
       address: MapsExtractorUtils.cleanAddress(fromUrl?.address) || fallback.address,
       phone: fromUrl?.phone || fallback.phone,
-      category: fromUrl?.category || fallback.category,
-      description: fromUrl?.description || fallback.description,
-      reviewsCount: fromUrl?.reviewsCount || fallback.reviewsCount
+      website: fromUrl?.website || fallback.website || "",
+      openingHours: fromUrl?.openingHours || fallback.openingHours || "",
+      category: fromUrl?.category || fallback.category
     };
-    if (expectedName && !namesLookSame(expectedName, candidate.name)) {
+    if (expectedName && candidate.name && !namesLookSame(expectedName, candidate.name)) {
       candidate.phone = "";
     }
     return candidate;
@@ -586,28 +1010,26 @@ async function clickCardAndExtract(card) {
 
   let merged = {
     name: MapsExtractorUtils.cleanName(details?.name) || fallback.name,
-    rating: details?.rating || fallback.rating,
     address: MapsExtractorUtils.cleanAddress(details?.address) || fallback.address,
     phone: details?.phone || fallback.phone,
-    category: details?.category || fallback.category,
-    description: details?.description || fallback.description,
-    reviewsCount: details?.reviewsCount || fallback.reviewsCount
+    website: details?.website || fallback.website || "",
+    openingHours: details?.openingHours || fallback.openingHours || "",
+    category: details?.category || fallback.category
   };
 
   if (!MapsExtractorUtils.cleanPhone(merged.phone)) {
     const fromUrl = await extractFromPlaceUrl(placeUrl);
     merged = {
       name: MapsExtractorUtils.cleanName(merged.name) || MapsExtractorUtils.cleanName(fromUrl?.name),
-      rating: merged.rating || fromUrl?.rating || "",
       address: MapsExtractorUtils.cleanAddress(merged.address) || MapsExtractorUtils.cleanAddress(fromUrl?.address),
       phone: merged.phone || fromUrl?.phone || "",
-      category: merged.category || fromUrl?.category || "",
-      description: merged.description || fromUrl?.description || "",
-      reviewsCount: merged.reviewsCount || fromUrl?.reviewsCount || ""
+      website: merged.website || fromUrl?.website || "",
+      openingHours: merged.openingHours || fromUrl?.openingHours || "",
+      category: merged.category || fromUrl?.category || ""
     };
   }
 
-  if (expectedName && !namesLookSame(expectedName, merged.name)) {
+  if (expectedName && merged.name && !namesLookSame(expectedName, merged.name)) {
     merged.phone = "";
   }
 
@@ -617,7 +1039,11 @@ async function clickCardAndExtract(card) {
 async function runExtraction(options) {
   extractorState.running = true;
   extractorState.stopRequested = false;
-  upsertOverlay("Maps Extractor: started...");
+  upsertOverlay(
+    "Maps Extractor: starting… Keep this Google Maps tab open. You may switch to other tabs or windows while it runs."
+  );
+
+  let result = null;
 
   try {
     await applySearchKeyword(options.searchKeyword || "");
@@ -625,7 +1051,81 @@ async function runExtraction(options) {
     const maxResults = Number(options.maxResults) || 100;
     await autoScrollResults(maxResults);
 
+    // Special case: user is on a single business page (/maps/place/<one>) with no
+    // results feed. Extract just that one business from the open Information panel
+    // instead of erroring out with "no cards" or matching the avatar button.
+    if (isOnSinglePlacePage()) {
+      const singleEntry = extractFromDetailsPanel("");
+      const candidate = {
+        name: MapsExtractorUtils.cleanName(singleEntry.name),
+        address: MapsExtractorUtils.cleanAddress(singleEntry.address),
+        phone: singleEntry.phone,
+        website: singleEntry.website || "",
+        openingHours: singleEntry.openingHours || "",
+        category: singleEntry.category || ""
+      };
+
+      const cleanedSingle = MapsExtractorUtils.dedupeEntries([candidate]);
+      const filteredSingle = cleanedSingle.filter((entry) =>
+        MapsExtractorUtils.matchesCategory(entry, options.categoryFilter || "")
+      );
+
+      const sample = `${candidate.name || "no-name"}:${MapsExtractorUtils.cleanPhone(candidate.phone) || "no-phone"}`;
+
+      if (filteredSingle.length === 0) {
+        result = {
+          success: false,
+          error:
+            "Single business page detected, but no usable phone number found. Go back to the Google Maps search results list and run again to scrape multiple businesses.",
+          debug: {
+            cardsFound: 1,
+            rawCollected: 1,
+            withPhone: cleanedSingle.length,
+            sample
+          }
+        };
+        return result;
+      }
+
+      result = {
+        success: true,
+        count: filteredSingle.length,
+        data: filteredSingle,
+        lines: filteredSingle.map((item) => MapsExtractorUtils.toPrettyLine(item)),
+        debug: {
+          cardsFound: 1,
+          rawCollected: 1,
+          withPhone: cleanedSingle.length,
+          sample
+        }
+      };
+      return result;
+    }
+
     const cards = getBusinessCards().slice(0, maxResults);
+
+    // Diagnostic: per-card (first card) structure + name resolution result, so
+    // we can see if readNameFromCard returns empty or if data is lost later.
+    const cardDiagnostic = (() => {
+      if (cards.length === 0) {
+        return "no-cards";
+      }
+      const c = cards[0];
+      const tag = (c.tagName || "").toLowerCase();
+      const aria = c.getAttribute?.("aria-label") || "";
+      const innerLink = c.querySelector?.("a[href*='/maps/place/']");
+      const innerLinkAria = innerLink?.getAttribute?.("aria-label") || "";
+      const resolvedName = readNameFromCard(c) || "EMPTY";
+      const expectedName = getExpectedNameFromCard(c) || "EMPTY";
+      return [
+        `tag:${tag}`,
+        `outerAria:${aria ? aria.slice(0, 30) : "NONE"}`,
+        `linkAria:${innerLinkAria ? innerLinkAria.slice(0, 30) : "NONE"}`,
+        `readName:${resolvedName.slice(0, 30)}`,
+        `expName:${expectedName.slice(0, 30)}`
+      ].join(" | ");
+    })();
+
     const rawData = [];
     let liveExtracted = 0;
     let lastFingerprint = "";
@@ -638,19 +1138,27 @@ async function runExtraction(options) {
       extracted: 0
     });
 
+    const perCardDebug = [];
+
     for (let i = 0; i < cards.length; i += 1) {
       const card = cards[i];
       if (extractorState.stopRequested) {
         break;
       }
 
+      const cardName = readNameFromCard(card);
       const entry = await clickCardAndExtract(card);
       const candidate = { ...entry };
+
+      if (i < 3) {
+        perCardDebug.push(
+          `c${i}={cardName:${(cardName || "EMPTY").slice(0, 25)},entryName:${(entry?.name || "EMPTY").slice(0, 25)},entryPhone:${entry?.phone || "EMPTY"}}`
+        );
+      }
       const fingerprint = [
         MapsExtractorUtils.cleanPhone(candidate.phone),
-        MapsExtractorUtils.trimText(candidate.rating),
         MapsExtractorUtils.cleanAddress(candidate.address),
-        MapsExtractorUtils.trimText(candidate.reviewsCount)
+        MapsExtractorUtils.trimText(candidate.website || "")
       ].join("|");
       const candidateName = MapsExtractorUtils.cleanName(candidate.name);
 
@@ -686,54 +1194,72 @@ async function runExtraction(options) {
       .map((item) => `${MapsExtractorUtils.trimText(item.name) || "no-name"}:${MapsExtractorUtils.cleanPhone(item.phone) || "no-phone"}`)
       .join(" | ");
 
+    const perCardSummary = perCardDebug.join(" || ");
+
+    const buildDebug = () => ({
+      cardsFound: cards.length,
+      rawCollected: rawData.length,
+      withPhone: cleaned.length,
+      sample,
+      cardShape: cardDiagnostic,
+      perCard: perCardSummary
+    });
+
     if (deduped.length === 0 && cleaned.length > 0) {
-      return {
+      result = {
         success: false,
         error: "No records matched category filter. Try empty filter or a real category like grocery, clothing, supermarket.",
-        debug: {
-          cardsFound: cards.length,
-          rawCollected: rawData.length,
-          withPhone: cleaned.length,
-          sample
-        }
+        debug: buildDebug()
       };
+      return result;
     }
 
     if (cleaned.length === 0) {
-      return {
+      const onPlacePage = /\/maps\/place\//.test(window.location.href);
+      const message =
+        cards.length === 0
+          ? onPlacePage
+            ? "You are on a single business page. Click the back arrow (or search a keyword) so the left-side results list appears, then run again."
+            : "No business cards found on this page. Open Google Maps search results (the left-side list) on this tab, then run again."
+          : "Cards were processed but no phone numbers were detected. These businesses may not list phones on Google Maps.";
+      result = {
         success: false,
-        error: "Cards were clicked but phone numbers were not detected. Try zooming in and opening full details list view.",
-        debug: {
-          cardsFound: cards.length,
-          rawCollected: rawData.length,
-          withPhone: cleaned.length,
-          sample
-        }
+        error: message,
+        debug: buildDebug()
       };
+      return result;
     }
 
-    return {
+    result = {
       success: true,
       count: deduped.length,
       data: deduped,
       lines: deduped.map((item) => MapsExtractorUtils.toPrettyLine(item)),
-      debug: {
-        cardsFound: cards.length,
-        rawCollected: rawData.length,
-        withPhone: cleaned.length,
-        sample
-      }
+      debug: buildDebug()
     };
+    return result;
   } catch (error) {
-    return {
+    result = {
       success: false,
       error: error.message || "Extraction failed."
     };
+    return result;
   } finally {
     sendProgress({
       stage: "done"
     });
     extractorState.running = false;
+
+    chrome.runtime
+      .sendMessage({
+        action: "extractionComplete",
+        success: Boolean(result?.success),
+        data: result?.data || [],
+        count: result?.count ?? 0,
+        error: result?.error || "",
+        debug: result?.debug
+      })
+      .catch(() => {});
   }
 }
 
@@ -761,3 +1287,5 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   return false;
 });
+
+} // end of __mapsExtractorContentLoaded__ guard

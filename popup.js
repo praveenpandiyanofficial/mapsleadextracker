@@ -141,19 +141,28 @@ async function startExtraction() {
       });
     }
 
+    const buildDebug = (d) => {
+      if (!d) return "";
+      const parts = [
+        `cards:${d.cardsFound}`,
+        `raw:${d.rawCollected}`,
+        `withPhone:${d.withPhone}`
+      ];
+      if (d.sample) parts.push(`sample:${d.sample}`);
+      if (d.cardShape) parts.push(`cardShape:${d.cardShape}`);
+      if (d.perCard) parts.push(`perCard:${d.perCard}`);
+      return parts.join(", ");
+    };
+
     if (!response?.success) {
-      const debug = response?.debug
-        ? ` [cards:${response.debug.cardsFound}, raw:${response.debug.rawCollected}, withPhone:${response.debug.withPhone}${response.debug.sample ? `, sample:${response.debug.sample}` : ""}]`
-        : "";
-      throw new Error((response?.error || "Extraction failed.") + debug);
+      const debug = buildDebug(response?.debug);
+      throw new Error((response?.error || "Extraction failed.") + (debug ? ` [${debug}]` : ""));
     }
 
     extractedData = response.data || [];
     updateCount();
     const preview = getPreviewText(extractedData);
-    const debug = response?.debug
-      ? ` cards:${response.debug.cardsFound}, raw:${response.debug.rawCollected}, withPhone:${response.debug.withPhone}${response.debug.sample ? `, sample:${response.debug.sample}` : ""}`
-      : "";
+    const debug = buildDebug(response?.debug);
     setStatus(`Done. ${response.count || 0} extracted.${debug}${preview ? ` First 2: ${preview}` : ""}`);
   } catch (error) {
     setStatus(error.message || "Failed to extract data.", true);
